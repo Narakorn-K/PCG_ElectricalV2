@@ -280,7 +280,7 @@ with tab2:
             # --- สรุปยอดใช้ไฟฟ้าเป็นการ์ด (แยกตามกลุ่ม Process / Packing) ---
             st.markdown(f"**สรุปยอดใช้ไฟฟ้าเดือน {month_labels[selected_month]}**")
             group_summary = filtered.groupby("group", sort=False)[["on_peak", "off_peak", "total"]].sum()
-            group_summary = group_summary.reindex(GROUP_ORDER)
+            group_summary = group_summary.reindex(GROUP_ORDER).fillna(0)
 
             card_cols = st.columns(len(GROUP_ORDER) + 1)
             for card_col, group_name in zip(card_cols, GROUP_ORDER):
@@ -307,6 +307,7 @@ with tab2:
                 )
             )
             bar_long["peak_type_th"] = bar_long["peak_type"].map({"on_peak": "On Peak", "off_peak": "Off Peak"})
+            bar_long["kwh"] = bar_long["kwh"].fillna(0)
 
             # --- รวมยอดผลิต PD Ton เข้ากับช่วงเดือนที่เลือก ---
             ton_filtered = ton_df[ton_df["date"].dt.to_period("M") == selected_month].copy()
@@ -314,6 +315,7 @@ with tab2:
                 filtered[["date", "day_label"]].drop_duplicates(), on="date", how="left"
             )
             ton_filtered = ton_filtered.dropna(subset=["day_label"])
+            ton_filtered["pd_ton"] = ton_filtered["pd_ton"].fillna(0)
 
             # ลำดับวันบนแกน X ให้ตรงกับข้อมูลไฟฟ้า
             day_order = filtered.sort_values("date")["day_label"].unique().tolist()
@@ -322,8 +324,13 @@ with tab2:
             low_prod_days = ton_filtered.loc[ton_filtered["pd_ton"] < LOW_PRODUCTION_THRESHOLD, "day_label"].tolist()
             highlight_df = pd.DataFrame({"day_label": low_prod_days})
 
-            max_kwh = (bar_long.groupby(["day_label"])["kwh"].sum().max() or 0) * 1.15
-            max_ton = (ton_filtered["pd_ton"].max() or 0) * 1.15
+            def _safe_max(value, fallback=1.0):
+                if value is None or pd.isna(value) or value <= 0:
+                    return fallback
+                return float(value)
+
+            max_kwh = _safe_max(bar_long.groupby(["day_label"])["kwh"].sum().max()) * 1.15
+            max_ton = _safe_max(ton_filtered["pd_ton"].max()) * 1.15
 
             base_x = alt.X(
                 "day_label:N",
