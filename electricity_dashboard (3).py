@@ -195,7 +195,12 @@ def load_product_ton_data():
     resp = requests.get(PRODUCT_TON_CSV_URL, timeout=15)
     resp.raise_for_status()
     resp.encoding = "utf-8"
-    raw = pd.read_csv(StringIO(resp.text), header=None, names=["date_raw", "pd_ton"])
+    # ระบุ usecols=[0, 1] แบบตำแหน่งชัดเจน (คอลัมน์ A, B) และ header=0 เพราะแถวแรกของชีตจริง
+    # คือหัวตาราง ("Date", "Product Ton", "__PowerAppsId__") ไม่ใช่ข้อมูล และชีตมีคอลัมน์ C
+    # แถมมาด้วย (ว่างเปล่าแต่มีหัวคอลัมน์) ถ้าไม่ระบุ usecols/header ให้ชัด pandas จะงงเรื่องจำนวนคอลัมน์
+    raw = pd.read_csv(
+        StringIO(resp.text), usecols=[0, 1], header=0, names=["date_raw", "pd_ton"]
+    )
 
     raw["date_raw"] = raw["date_raw"].astype(str).str.strip()
     parsed = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
