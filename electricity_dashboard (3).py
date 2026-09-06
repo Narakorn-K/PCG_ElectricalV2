@@ -346,8 +346,9 @@ with tab2:
             # ลำดับวันบนแกน X ให้ตรงกับข้อมูลไฟฟ้า
             day_order = filtered.sort_values("date")["day_label"].unique().tolist()
 
-            # วันที่ผลิตต่ำกว่า threshold -> ถือว่าเป็นวันหยุด/ไม่มีการผลิต -> ใส่กรอบแดงที่ป้ายวันที่
-            low_prod_days = set(ton_filtered.loc[ton_filtered["pd_ton"] < LOW_PRODUCTION_THRESHOLD, "day_label"])
+            # วันที่ผลิตต่ำกว่า threshold -> ไฮไลต์พื้นหลังใต้แกน X (สมมติว่าคือวันหยุด/ไม่มีการผลิต)
+            low_prod_days = ton_filtered.loc[ton_filtered["pd_ton"] < LOW_PRODUCTION_THRESHOLD, "day_label"].tolist()
+            highlight_df = pd.DataFrame({"day_label": low_prod_days})
 
             def _safe_max(value, fallback=1.0):
                 if value is None or pd.isna(value) or value <= 0:
@@ -357,12 +358,19 @@ with tab2:
             max_kwh = _safe_max(bar_long["kwh"].max()) * 1.15
             max_ton = _safe_max(ton_filtered["pd_ton"].max()) * 1.15
 
-            # ซ่อน label เดิมของแกน X เพราะจะวาดป้ายวันที่เองด้านล่าง (2 บรรทัด: วันที่ / (วัน) )
             base_x = alt.X(
                 "day_label:N",
                 sort=day_order,
                 title=None,
-                axis=alt.Axis(labels=False, ticks=False, domain=False, title=None),
+                axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE, labelAngle=-45),
+            )
+
+            # แถบพื้นหลังไฮไลต์วันหยุด/วันที่ไม่มีการผลิต
+            highlight_layer = (
+                alt.Chart(highlight_df)
+                .mark_rect(color="#FDE2E2", opacity=0.9)
+                .encode(x=base_x)
+                .properties(height=420)
             )
 
             bar_chart = (
@@ -385,7 +393,7 @@ with tab2:
                     ),
                     tooltip=["day_label", "group", "kwh"],
                 )
-                .properties(height=380, width="container")
+                .properties(height=420)
             )
 
             line_chart = (
@@ -401,46 +409,14 @@ with tab2:
                     ),
                     tooltip=["day_label", "pd_ton"],
                 )
-                .properties(height=380, width="container")
+                .properties(height=420)
             )
-
-            top_chart = alt.layer(bar_chart, line_chart).resolve_scale(y="independent")
-
-            # --- แถบป้ายวันที่ วาดเอง 2 บรรทัด (วันที่ / (วัน)) ทุกวันไม่มีการซ่อน + กรอบแดงวันที่ผลิตต่ำ ---
-            label_df = pd.DataFrame({"day_label": day_order})
-            label_df["date_line"] = label_df["day_label"].str.split(" ").str[0]
-            label_df["weekday_line"] = label_df["day_label"].str.split(" ").str[1]
-            label_df["display_text"] = label_df["date_line"] + "\n" + label_df["weekday_line"]
-            label_df["is_low"] = label_df["day_label"].isin(low_prod_days)
-
-            label_box = (
-                alt.Chart(label_df[label_df["is_low"]])
-                .mark_rect(stroke="#D32F2F", strokeWidth=1.5, fill=None, cornerRadius=2)
-                .encode(x=alt.X("day_label:N", sort=day_order, axis=None, title=None))
-                .properties(height=40, width="container")
-            )
-
-            label_text = (
-                alt.Chart(label_df)
-                .mark_text(baseline="middle", align="center", lineBreak="\n", fontSize=CHART_AXIS_SIZE)
-                .encode(
-                    x=alt.X("day_label:N", sort=day_order, axis=None, title=None),
-                    text="display_text:N",
-                    color=alt.condition(
-                        alt.datum.is_low, alt.value("#D32F2F"), alt.value("#3d3d3d")
-                    ),
-                )
-                .properties(height=40, width="container")
-            )
-
-            label_row = alt.layer(label_box, label_text)
 
             combo_chart = (
-                alt.vconcat(top_chart, label_row, spacing=2)
-                .resolve_scale(x="shared")
+                alt.layer(highlight_layer, bar_chart, line_chart)
+                .resolve_scale(y="independent")
                 .properties(title="การใช้พลังงานปั๊มลม เทียบกับยอดการผลิต Extruder")
             )
-
 
             st.altair_chart(combo_chart, use_container_width=True)
 
