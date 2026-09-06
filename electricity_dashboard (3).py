@@ -188,19 +188,40 @@ def load_daily_data():
 
 @st.cache_data(ttl=300)
 def load_product_ton_data():
-    """โหลดยอดผลิต Extruder (PD Ton) จากชีต 'Product Ton' (คอลัมน์ A = วันที่ dd-mm-yyyy, B = ตัน)"""
+    """โหลดยอดผลิต Extruder (PD Ton) จากชีต 'Product Ton' (คอลัมน์ A = วันที่, B = ตัน)
+    รองรับหลายรูปแบบวันที่ เพราะตอน export เป็น CSV รูปแบบวันที่จาก Google Sheets
+    อาจไม่ตรงกับที่เห็นในหน้าจอ (เช่น ถูก export เป็น yyyy-mm-dd แทนที่จะเป็น dd-mm-yyyy)
+    """
     resp = requests.get(PRODUCT_TON_CSV_URL, timeout=15)
     resp.raise_for_status()
     resp.encoding = "utf-8"
     raw = pd.read_csv(StringIO(resp.text), header=None, names=["date_raw", "pd_ton"])
-    raw["date"] = pd.to_datetime(raw["date_raw"], format="%d-%m-%Y", errors="coerce")
-    # เผื่อบางแถวรูปแบบไม่ตรง ลองแปลงแบบทั่วไปอีกรอบ (dayfirst)
-    mask = raw["date"].isna()
-    if mask.any():
-        raw.loc[mask, "date"] = pd.to_datetime(raw.loc[mask, "date_raw"], dayfirst=True, errors="coerce")
+
+    raw["date_raw"] = raw["date_raw"].astype(str).str.strip()
+    parsed = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+
+    # ลองไล่ทีละรูปแบบที่เป็นไปได้ ก่อนจะปล่อยให้ pandas เดาแบบอิสระ (dayfirst) เป็นด่านสุดท้าย
+    candidate_formats = ["%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%m-%y", "%d/%m/%y"]
+    for fmt in candidate_formats:
+        still_missing = parsed.isna()
+        if not still_missing.any():
+            break
+        parsed.loc[still_missing] = pd.to_datetime(
+            raw.loc[still_missing, "date_raw"], format=fmt, errors="coerce"
+        )
+
+    still_missing = parsed.isna()
+    if still_missing.any():
+        parsed.loc[still_missing] = pd.to_datetime(
+            raw.loc[still_missing, "date_raw"], dayfirst=True, errors="coerce"
+        )
+
+    raw["date"] = parsed
     raw["pd_ton"] = raw["pd_ton"].apply(_parse_number)
-    raw = raw.dropna(subset=["date"])[["date", "pd_ton"]]
-    return raw
+    n_total = len(raw)
+    n_parsed = raw["date"].notna().sum()
+    result = raw.dropna(subset=["date"])[["date", "pd_ton"]].copy()
+    return result, n_total, n_parsed, raw.head(5)
 
 
 st.title("⚡ สถานะการใช้ไฟฟ้า Air Compressor")
@@ -260,7 +281,7 @@ with tab1:
 with tab2:
     try:
         daily_df = load_daily_data()
-        ton_df = load_product_ton_data()
+        ton_df, ton_n_total, ton_n_parsed, ton_sample = load_product_ton_data()
 
         if daily_df.empty:
             st.warning("ไม่พบข้อมูลในชีต Daily ตรวจสอบชื่อ Meter / SHEET_ID / GID")
@@ -293,20 +314,13 @@ with tab2:
                 )
             card_cols[-1].metric("รวมทั้งหมด (Total เดือนนี้)", f"{group_summary['total'].sum():,.0f} kWh")
 
-            # --- เตรียมข้อมูลกราฟ: รวม AC1-3+AC4-6 = Process, AC7+AC8 = Packing ---
-            # แยกเป็น on_peak/off_peak ซ้อนกันในแท่งเดียว (stacked) ต่อกลุ่ม
+            # --- เตรียมข้อมูลกราฟแท่ง: รวม AC1-3+AC4-6 = Process, AC7+AC8 = Packing (ยอดรวม kWh ต่อวัน ไม่แยก peak) ---
             bar_long = (
-                filtered.groupby(["date", "day_label", "weekday", "group"], sort=False)[["on_peak", "off_peak"]]
+                filtered.groupby(["date", "day_label", "weekday", "group"], sort=False)["total"]
                 .sum()
                 .reset_index()
-                .melt(
-                    id_vars=["date", "day_label", "weekday", "group"],
-                    value_vars=["on_peak", "off_peak"],
-                    var_name="peak_type",
-                    value_name="kwh",
-                )
+                .rename(columns={"total": "kwh"})
             )
-            bar_long["peak_type_th"] = bar_long["peak_type"].map({"on_peak": "On Peak", "off_peak": "Off Peak"})
             bar_long["kwh"] = bar_long["kwh"].fillna(0)
 
             # --- รวมยอดผลิต PD Ton เข้ากับช่วงเดือนที่เลือก ---
@@ -316,6 +330,13 @@ with tab2:
             )
             ton_filtered = ton_filtered.dropna(subset=["day_label"])
             ton_filtered["pd_ton"] = ton_filtered["pd_ton"].fillna(0)
+
+            if ton_filtered.empty:
+                st.warning(
+                    f"⚠️ ไม่พบข้อมูล PD Ton สำหรับเดือน {month_labels[selected_month]} "
+                    f"(อ่านข้อมูลจากชีต Product Ton ได้ทั้งหมด {ton_n_total} แถว แปลงวันที่สำเร็จ {ton_n_parsed} แถว) "
+                    "ลองเปิดช่อง 'ตรวจสอบข้อมูล PD Ton' ด้านล่างเพื่อดูตัวอย่างข้อมูลดิบ"
+                )
 
             # ลำดับวันบนแกน X ให้ตรงกับข้อมูลไฟฟ้า
             day_order = filtered.sort_values("date")["day_label"].unique().tolist()
@@ -329,7 +350,7 @@ with tab2:
                     return fallback
                 return float(value)
 
-            max_kwh = _safe_max(bar_long.groupby(["day_label"])["kwh"].sum().max()) * 1.15
+            max_kwh = _safe_max(bar_long["kwh"].max()) * 1.15
             max_ton = _safe_max(ton_filtered["pd_ton"].max()) * 1.15
 
             base_x = alt.X(
@@ -356,7 +377,6 @@ with tab2:
                     y=alt.Y(
                         "kwh:Q",
                         title="kWh",
-                        stack=True,
                         scale=alt.Scale(domain=[0, max_kwh]),
                         axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE),
                     ),
@@ -366,13 +386,7 @@ with tab2:
                         scale=alt.Scale(domain=GROUP_ORDER, range=[GROUP_COLORS[g] for g in GROUP_ORDER]),
                         legend=alt.Legend(title=None, labelFontSize=CHART_LEGEND_SIZE),
                     ),
-                    opacity=alt.Opacity(
-                        "peak_type_th:N",
-                        scale=alt.Scale(domain=["On Peak", "Off Peak"], range=[1.0, 0.55]),
-                        legend=alt.Legend(title="ช่วงเวลา", labelFontSize=CHART_LEGEND_SIZE),
-                    ),
-                    order=alt.Order("peak_type:N"),
-                    tooltip=["day_label", "group", "peak_type_th", "kwh"],
+                    tooltip=["day_label", "group", "kwh"],
                 )
                 .properties(height=420)
             )
@@ -408,6 +422,11 @@ with tab2:
                     use_container_width=True,
                 )
                 st.dataframe(ton_filtered.sort_values("date"), use_container_width=True)
+
+            with st.expander("🔍 ตรวจสอบข้อมูล PD Ton (สำหรับ debug)"):
+                st.write(f"อ่านจากชีต Product Ton ได้ทั้งหมด {ton_n_total} แถว, แปลงวันที่สำเร็จ {ton_n_parsed} แถว")
+                st.write("ตัวอย่าง 5 แถวแรกที่อ่านได้ (คอลัมน์ date_raw คือค่าดิบจาก CSV, date คือค่าที่แปลงแล้ว):")
+                st.dataframe(ton_sample, use_container_width=True)
 
     except Exception as e:
         st.error(f"โหลดข้อมูล Daily ไม่สำเร็จ: {e}")
