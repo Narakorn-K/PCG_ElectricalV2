@@ -2,6 +2,7 @@
 Streamlit dashboard: สถานะไฟฟ้า Air Compressor
 แท็บ 1: Real-time monitor จาก Google Sheet ที่ Node-RED POST เข้าไป (ผ่าน Google Apps Script)
 แท็บ 2: ปริมาณการใช้ไฟฟ้ารายวัน (On Peak / Off Peak / Total) จากชีต "Daily"
+         + เทียบกับยอดผลิต Extruder (PD Ton) จากชีต "Product Ton" แบบกราฟรวม (combo chart)
 
 วิธีติดตั้ง:
     pip install streamlit pandas requests streamlit-autorefresh altair
@@ -55,6 +56,27 @@ DAILY_METER_NAME_MAP = {
     "AirComp_P1234": "ac1_3",
 }
 DAILY_DATA_YEAR = 2026  # ปี ค.ศ. ของข้อมูล (ในชีตมีแค่ dd/mm ไม่มีปี)
+
+# กลุ่มปั๊มลม: Process = AC1-3 + AC4-6 รวมกัน, Packing = AC7 + AC8 รวมกัน
+METER_GROUP_MAP = {
+    "ac1_3": "ปั๊มลม Process",
+    "ac4_6": "ปั๊มลม Process",
+    "ac7": "ปั๊มลม Packing",
+    "ac8": "ปั๊มลม Packing",
+}
+GROUP_ORDER = ["ปั๊มลม Process", "ปั๊มลม Packing"]
+GROUP_COLORS = {"ปั๊มลม Process": "#E58426", "ปั๊มลม Packing": "#2E6B34"}
+
+# ============== CONFIG: ยอดผลิต Extruder (PD Ton) ==============
+# อยู่ในไฟล์เดียวกับชีต Daily แต่คนละแท็บ ชื่อ "Product Ton"
+# คอลัมน์ A = วันที่ (รูปแบบ dd-mm-yyyy), คอลัมน์ B = ยอดผลิต (ตัน)
+PRODUCT_TON_GID = "1847351361"
+PRODUCT_TON_CSV_URL = (
+    f"https://docs.google.com/spreadsheets/d/{DAILY_SHEET_ID}/export?format=csv&gid={PRODUCT_TON_GID}"
+)
+
+# วันที่ PD Ton ต่ำกว่าค่านี้ จะถือว่าเป็นวันหยุด/ไม่มีการผลิต -> ไฮไลต์พื้นหลังสีแดงอ่อนใต้แกน X
+LOW_PRODUCTION_THRESHOLD = 50
 
 # ==========================================================
 
@@ -151,6 +173,7 @@ def load_daily_data():
             records.append({
                 "meter_key": key,
                 "meter_name": DISPLAY_NAMES.get(key, key),
+                "group": METER_GROUP_MAP.get(key, key),
                 "date": date_val,
                 "weekday": wd,
                 "on_peak": _parse_number(row[onpeak_idx]),
@@ -161,6 +184,23 @@ def load_daily_data():
     long_df = pd.DataFrame(records)
     long_df = long_df.sort_values(["date", "meter_key"])
     return long_df
+
+
+@st.cache_data(ttl=300)
+def load_product_ton_data():
+    """โหลดยอดผลิต Extruder (PD Ton) จากชีต 'Product Ton' (คอลัมน์ A = วันที่ dd-mm-yyyy, B = ตัน)"""
+    resp = requests.get(PRODUCT_TON_CSV_URL, timeout=15)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    raw = pd.read_csv(StringIO(resp.text), header=None, names=["date_raw", "pd_ton"])
+    raw["date"] = pd.to_datetime(raw["date_raw"], format="%d-%m-%Y", errors="coerce")
+    # เผื่อบางแถวรูปแบบไม่ตรง ลองแปลงแบบทั่วไปอีกรอบ (dayfirst)
+    mask = raw["date"].isna()
+    if mask.any():
+        raw.loc[mask, "date"] = pd.to_datetime(raw.loc[mask, "date_raw"], dayfirst=True, errors="coerce")
+    raw["pd_ton"] = raw["pd_ton"].apply(_parse_number)
+    raw = raw.dropna(subset=["date"])[["date", "pd_ton"]]
+    return raw
 
 
 st.title("⚡ สถานะการใช้ไฟฟ้า Air Compressor")
@@ -220,6 +260,8 @@ with tab1:
 with tab2:
     try:
         daily_df = load_daily_data()
+        ton_df = load_product_ton_data()
+
         if daily_df.empty:
             st.warning("ไม่พบข้อมูลในชีต Daily ตรวจสอบชื่อ Meter / SHEET_ID / GID")
         else:
@@ -232,45 +274,125 @@ with tab2:
                 index=len(month_options) - 1,
             )
 
-            metric_choice = st.radio(
-                "แสดงค่า", options=["total", "on_peak", "off_peak"],
-                format_func=lambda x: {"total": "Total", "on_peak": "On Peak", "off_peak": "Off Peak"}[x],
-                horizontal=True,
-            )
-
             filtered = daily_df[daily_df["date"].dt.to_period("M") == selected_month].copy()
             filtered["day_label"] = filtered["date"].dt.strftime("%d/%m") + " (" + filtered["weekday"] + ")"
 
+            # --- สรุปยอดใช้ไฟฟ้าเป็นการ์ด (แยกตามกลุ่ม Process / Packing) ---
             st.markdown(f"**สรุปยอดใช้ไฟฟ้าเดือน {month_labels[selected_month]}**")
-            summary = filtered.groupby("meter_name", sort=False)[["on_peak", "off_peak", "total"]].sum()
-            summary = summary.reindex([DISPLAY_NAMES[k] for k in ["ac1_3", "ac4_6", "ac7", "ac8"]])
+            group_summary = filtered.groupby("group", sort=False)[["on_peak", "off_peak", "total"]].sum()
+            group_summary = group_summary.reindex(GROUP_ORDER)
 
-            card_cols = st.columns(4)
-            for card_col, meter_name in zip(card_cols, summary.index):
-                row = summary.loc[meter_name]
+            card_cols = st.columns(len(GROUP_ORDER) + 1)
+            for card_col, group_name in zip(card_cols, GROUP_ORDER):
+                row = group_summary.loc[group_name]
                 card_col.metric(
-                    meter_name,
+                    group_name,
                     f"{row['total']:,.0f} kWh",
                     delta=f"On Peak {row['on_peak']:,.0f} | Off Peak {row['off_peak']:,.0f}",
                     delta_color="off",
                 )
-            st.metric("รวมทั้งหมด (Total เดือนนี้)", f"{summary['total'].sum():,.0f} kWh")
+            card_cols[-1].metric("รวมทั้งหมด (Total เดือนนี้)", f"{group_summary['total'].sum():,.0f} kWh")
+
+            # --- เตรียมข้อมูลกราฟ: รวม AC1-3+AC4-6 = Process, AC7+AC8 = Packing ---
+            # แยกเป็น on_peak/off_peak ซ้อนกันในแท่งเดียว (stacked) ต่อกลุ่ม
+            bar_long = (
+                filtered.groupby(["date", "day_label", "weekday", "group"], sort=False)[["on_peak", "off_peak"]]
+                .sum()
+                .reset_index()
+                .melt(
+                    id_vars=["date", "day_label", "weekday", "group"],
+                    value_vars=["on_peak", "off_peak"],
+                    var_name="peak_type",
+                    value_name="kwh",
+                )
+            )
+            bar_long["peak_type_th"] = bar_long["peak_type"].map({"on_peak": "On Peak", "off_peak": "Off Peak"})
+
+            # --- รวมยอดผลิต PD Ton เข้ากับช่วงเดือนที่เลือก ---
+            ton_filtered = ton_df[ton_df["date"].dt.to_period("M") == selected_month].copy()
+            ton_filtered = ton_filtered.merge(
+                filtered[["date", "day_label"]].drop_duplicates(), on="date", how="left"
+            )
+            ton_filtered = ton_filtered.dropna(subset=["day_label"])
+
+            # ลำดับวันบนแกน X ให้ตรงกับข้อมูลไฟฟ้า
+            day_order = filtered.sort_values("date")["day_label"].unique().tolist()
+
+            # วันที่ผลิตต่ำกว่า threshold -> ไฮไลต์พื้นหลังใต้แกน X (สมมติว่าคือวันหยุด/ไม่มีการผลิต)
+            low_prod_days = ton_filtered.loc[ton_filtered["pd_ton"] < LOW_PRODUCTION_THRESHOLD, "day_label"].tolist()
+            highlight_df = pd.DataFrame({"day_label": low_prod_days})
+
+            max_kwh = (bar_long.groupby(["day_label"])["kwh"].sum().max() or 0) * 1.15
+            max_ton = (ton_filtered["pd_ton"].max() or 0) * 1.15
+
+            base_x = alt.X(
+                "day_label:N",
+                sort=day_order,
+                title=None,
+                axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE, labelAngle=-45),
+            )
+
+            # แถบพื้นหลังไฮไลต์วันหยุด/วันที่ไม่มีการผลิต
+            highlight_layer = (
+                alt.Chart(highlight_df)
+                .mark_rect(color="#FDE2E2", opacity=0.9)
+                .encode(x=base_x)
+                .properties(height=420)
+            )
 
             bar_chart = (
-                alt.Chart(filtered)
+                alt.Chart(bar_long)
                 .mark_bar()
                 .encode(
-                    x=alt.X("day_label:N", sort=None, title=None,
-                            axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE, labelAngle=-45)),
-                    y=alt.Y(f"{metric_choice}:Q", title="kWh",
-                            axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE)),
-                    color=alt.Color("meter_name:N", legend=alt.Legend(title=None, labelFontSize=CHART_LEGEND_SIZE)),
-                    xOffset="meter_name:N",
-                    tooltip=["day_label", "meter_name", "on_peak", "off_peak", "total"],
+                    x=base_x,
+                    xOffset=alt.XOffset("group:N", sort=GROUP_ORDER),
+                    y=alt.Y(
+                        "kwh:Q",
+                        title="kWh",
+                        stack=True,
+                        scale=alt.Scale(domain=[0, max_kwh]),
+                        axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE),
+                    ),
+                    color=alt.Color(
+                        "group:N",
+                        sort=GROUP_ORDER,
+                        scale=alt.Scale(domain=GROUP_ORDER, range=[GROUP_COLORS[g] for g in GROUP_ORDER]),
+                        legend=alt.Legend(title=None, labelFontSize=CHART_LEGEND_SIZE),
+                    ),
+                    opacity=alt.Opacity(
+                        "peak_type_th:N",
+                        scale=alt.Scale(domain=["On Peak", "Off Peak"], range=[1.0, 0.55]),
+                        legend=alt.Legend(title="ช่วงเวลา", labelFontSize=CHART_LEGEND_SIZE),
+                    ),
+                    order=alt.Order("peak_type:N"),
+                    tooltip=["day_label", "group", "peak_type_th", "kwh"],
                 )
                 .properties(height=420)
             )
-            st.altair_chart(bar_chart, use_container_width=True)
+
+            line_chart = (
+                alt.Chart(ton_filtered)
+                .mark_line(color="#D32F2F", point=alt.OverlayMarkDef(color="#D32F2F", shape="diamond", size=90))
+                .encode(
+                    x=base_x,
+                    y=alt.Y(
+                        "pd_ton:Q",
+                        title="PD Ton",
+                        scale=alt.Scale(domain=[0, max_ton]),
+                        axis=alt.Axis(labelFontSize=CHART_AXIS_SIZE, titleFontSize=CHART_AXIS_SIZE),
+                    ),
+                    tooltip=["day_label", "pd_ton"],
+                )
+                .properties(height=420)
+            )
+
+            combo_chart = (
+                alt.layer(highlight_layer, bar_chart, line_chart)
+                .resolve_scale(y="independent")
+                .properties(title="การใช้พลังงานปั๊มลม เทียบกับยอดการผลิต Extruder")
+            )
+
+            st.altair_chart(combo_chart, use_container_width=True)
 
             with st.expander("ดูข้อมูลดิบ"):
                 st.dataframe(
@@ -278,7 +400,8 @@ with tab2:
                     .sort_values(["date", "meter_name"]),
                     use_container_width=True,
                 )
+                st.dataframe(ton_filtered.sort_values("date"), use_container_width=True)
 
     except Exception as e:
         st.error(f"โหลดข้อมูล Daily ไม่สำเร็จ: {e}")
-        st.info("ตรวจสอบว่า DAILY_SHEET_ID / DAILY_GID ถูกต้อง และชีตเปิด public (Anyone with link can view)")
+        st.info("ตรวจสอบว่า DAILY_SHEET_ID / DAILY_GID / PRODUCT_TON_GID ถูกต้อง และชีตเปิด public (Anyone with link can view)")
